@@ -738,3 +738,296 @@ func applyReflector(qh blas64.General, q blas64.General, v []float64) {
 		}
 	}
 }
+
+func dlattb(kind int, uplo blas.Uplo, trans blas.Transpose, n, kd int, ab []float64, ldab int, rnd *rand.Rand) (diag blas.Diag, b []float64) {
+	switch {
+	case kind <= 0:
+		panic("bad matrix kind")
+	case (6 <= kind && kind <= 9) || kind == 17:
+		diag = blas.Unit
+	default:
+		diag = blas.NonUnit
+	}
+
+	if n == 0 {
+		return
+	}
+
+	var (
+		unfl   = dlamchS
+		ulp    = dlamchE * dlamchB
+		smlnum = unfl
+		bignum = (1 - ulp) / smlnum
+
+		eps   = dlamchP
+		badc2 = 0.1 / eps
+		badc1 = math.Sqrt(badc2)
+		small = 0.25 * (dlamchS / eps)
+		large = 1 / small
+	)
+
+	var cndnum float64
+	switch {
+	case kind == 2 || kind == 8:
+		cndnum = badc1
+	case kind == 3 || kind == 9:
+		cndnum = badc2
+	default:
+		cndnum = 2
+	}
+
+	uniformM11 := func() float64 {
+		return 2*rnd.Float64() - 1
+	}
+
+	// Allocate the right-hand side and fill it with random numbers.
+	// The pathological matrix types below overwrite it with their
+	// custom vector.
+	b = make([]float64, n)
+	for i := range b {
+		b[i] = rnd.NormFloat64()
+	}
+
+	bi := blas64.Implementation()
+	switch {
+	default:
+		panic("test matrix type not implemented")
+
+	case 1 <= kind && kind <= 5:
+		// Non-unit triangular matrix
+		// TODO(vladimir-ch)
+		var kl, ku int
+		switch uplo {
+		case blas.Upper:
+			ku = kd
+			kl = 0
+			// IOFF = 1 + MAX( 0, KD-N+1 )
+			// PACKIT = 'Q'
+			// 'Q' => store the upper triangle in band storage scheme
+			//        (only if matrix symmetric or upper triangular)
+		case blas.Lower:
+			ku = 0
+			kl = kd
+			// IOFF = 1
+			// PACKIT = 'B'
+			// 'B' => store the lower triangle in band storage scheme
+			//        (only if matrix symmetric or lower triangular)
+		}
+		anorm := 1.0
+		switch kind {
+		case 4:
+			anorm = small
+		case 5:
+			anorm = large
+		}
+		_, _, _ = kl, ku, anorm
+		// // DIST = 'S' // UNIFORM(-1, 1)
+		// // MODE = 3   // MODE = 3 sets D(I)=CNDNUM**(-(I-1)/(N-1))
+		// // TYPE = 'N' // If TYPE='N', the generated matrix is nonsymmetric
+		// CALL DLATMS( N, N, DIST, ISEED, TYPE, B, MODE, CNDNUM, ANORM,
+		// $            KL, KU, PACKIT, AB( IOFF, 1 ), LDAB, WORK, INFO )
+		panic("test matrix type not implemented")
+
+	case kind == 6:
+		// Matrix is the identity.
+		if uplo == blas.Upper {
+			for i := 0; i < n; i++ {
+				// Fill the diagonal with random numbers.
+				ab[i*ldab] = rnd.NormFloat64()
+				for j := 1; j < min(n-i, kd+1); j++ {
+					ab[i*ldab+j] = 0
+				}
+			}
+		} else {
+			for i := 0; i < n; i++ {
+				for j := max(kd-i, 0); j < kd; j++ {
+					ab[i*ldab+j] = 0
+				}
+				// Fill the diagonal with random numbers.
+				ab[i*ldab+kd] = rnd.NormFloat64()
+			}
+		}
+
+	case kind <= 9:
+		// Non-trivial unit triangular matrix
+		//
+		// A unit triangular matrix T with condition cndnum is formed.
+		// In this version, T only has bandwidth 2, the rest of it is
+		// zero.
+
+		tnorm := math.Sqrt(cndnum)
+
+		// Initialize AB to zero.
+		if uplo == blas.Upper {
+			for i := 0; i < n; i++ {
+				// Fill the diagonal with random numbers.
+				ab[i*ldab] = rnd.NormFloat64()
+				for j := 1; j < min(n-i, kd+1); j++ {
+					ab[i*ldab+j] = 0
+				}
+			}
+		} else {
+			for i := 0; i < n; i++ {
+				for j := max(kd-i, 0); j < kd; j++ {
+					ab[i*ldab+j] = 0
+				}
+				// Fill the diagonal with random numbers.
+				ab[i*ldab+kd] = rnd.NormFloat64()
+			}
+		}
+
+		switch kd {
+		case 0:
+			// Unit diagonal matrix, nothing else to do.
+		case 1:
+			// Special case: T is tridiagonal. Set every other
+			// off-diagonal so that the matrix has norm tnorm+1.
+			if n > 1 {
+				if uplo == blas.Upper {
+					ab[1] = math.Copysign(tnorm, uniformM11())
+					for i := 2; i < n-1; i += 2 {
+						ab[i*ldab+1] = tnorm * uniformM11()
+					}
+				} else {
+					ab[ldab] = math.Copysign(tnorm, uniformM11())
+					for i := 3; i < n; i += 2 {
+						ab[i*ldab] = tnorm * uniformM11()
+					}
+				}
+			}
+		default:
+			// Form a unit triangular matrix T with condition
+			// cndnum. T is given by
+			//      | 1   +   *                      |
+			//      |     1   +                      |
+			//  T = |         1   +   *              |
+			//      |             1   +              |
+			//      |                 1   +   *      |
+			//      |                     1   +      |
+			//      |                          . . . |
+			// Each element marked with a '*' is formed by taking
+			// the product of the adjacent elements marked with '+'.
+			// The '*'s can be chosen freely, and the '+'s are
+			// chosen so that the inverse of T will have elements of
+			// the same magnitude as T.
+			star1 := math.Copysign(tnorm, uniformM11())
+			sfac := math.Sqrt(tnorm)
+			plus1 := math.Copysign(sfac, uniformM11())
+			for i := 0; i < n; i += 2 {
+				ab[i*ldab+1] = plus1
+				ab[i*ldab+2] = star1
+				if i+1 < n {
+					plus2 := star1 / plus1
+					ab[(i+1)*ldab+1] = plus2
+					plus1 = star1 / plus2
+					// Generate a new *-value with norm between sqrt(tnorm)
+					// and tnorm.
+					rexp := uniformM11()
+					if rexp < 0 {
+						star1 = -math.Pow(sfac, 1-rexp)
+					} else {
+						star1 = math.Pow(sfac, 1+rexp)
+					}
+				}
+			}
+		}
+
+	// Pathological test cases 10-18: these triangular matrices are badly
+	// scaled or badly conditioned, so when used in solving a triangular
+	// system they may cause overflow in the solution vector.
+
+	case kind == 10:
+		// Generate a triangular matrix with elements between -1 and 1.
+		// Give the diagonal norm 2 to make it well-conditioned.
+		// Make the right hand side large so that it requires scaling.
+		if uplo == blas.Upper {
+			for i := 0; i < n; i++ {
+				for j := 0; j < min(n-j, kd+1); j++ {
+					ab[i*ldab+j] = uniformM11()
+				}
+				ab[i*ldab] = math.Copysign(2, ab[i*ldab])
+			}
+		} else {
+			for i := 0; i < n; i++ {
+				for j := max(kd-i, 0); j < kd+1; j++ {
+					ab[i*ldab+j] = uniformM11()
+				}
+				ab[i*ldab+kd] = math.Copysign(2, ab[i*ldab+kd])
+			}
+		}
+		// Set the right hand side so that the largest value is bignum.
+		dlarnv(b, 2, rnd)
+		bnorm := math.Abs(b[bi.Idamax(n, b, 1)])
+		bscal := bignum / math.Max(1, bnorm)
+		bi.Dscal(n, bscal, b, 1)
+
+	case kind == 11:
+		// Make the first diagonal element in the solve small to cause
+		// immediate overflow when dividing by T[j,j].
+		// The offdiagonal elements are small (cnorm[j] < 1).
+		dlarnv(b, 2, rnd)
+		tscal := 1 / float64(kd+1)
+		if uplo == blas.Upper {
+			for i := 0; i < n; i++ {
+				jlen := min(n-i, kd+1)
+				arow := ab[i*ldab : i*ldab+jlen]
+				dlarnv(arow, 2, rnd)
+				if jlen > 1 {
+					bi.Dscal(jlen-1, tscal, arow[1:], 1)
+				}
+				ab[i*ldab] = math.Copysign(1, ab[i*ldab])
+			}
+			ab[(n-1)*ldab] *= smlnum
+		} else {
+			for i := 0; i < n; i++ {
+				jlen := min(i+1, kd+1)
+				arow := ab[i*ldab+kd+1-jlen : i*ldab+kd+1]
+				dlarnv(arow, 2, rnd)
+				if jlen > 1 {
+					bi.Dscal(jlen-1, tscal, arow[:jlen-1], 1)
+				}
+				ab[i*ldab+kd] = math.Copysign(1, ab[i*ldab+kd])
+			}
+			ab[kd] *= smlnum
+		}
+
+	case kind == 12:
+		// Make the first diagonal element in the solve small to cause
+		// immediate overflow when dividing by T[j,j].
+		// The offdiagonal elements are O(1) (cnorm[j] > 1).
+		dlarnv(b, 2, rnd)
+		if uplo == blas.Upper {
+			for i := 0; i < n; i++ {
+				jlen := min(n-i, kd+1)
+				arow := ab[i*ldab : i*ldab+jlen]
+				dlarnv(arow, 2, rnd)
+				ab[i*ldab] = math.Copysign(1, ab[i*ldab])
+			}
+			ab[(n-1)*ldab] *= smlnum
+		} else {
+			for i := 0; i < n; i++ {
+				jlen := min(i+1, kd+1)
+				arow := ab[i*ldab+kd+1-jlen : i*ldab+kd+1]
+				dlarnv(arow, 2, rnd)
+				ab[i*ldab+kd] = math.Copysign(1, ab[i*ldab+kd])
+			}
+			ab[kd] *= smlnum
+		}
+	}
+
+	// Flip the matrix if the transpose will be used.
+	if trans != blas.NoTrans {
+		if uplo == blas.Upper {
+			for j := 0; j < n/2; j++ {
+			// LENJ = MIN( N-2*J+1, KD+1 )
+			// CALL DSWAP( LENJ, AB( KD+1, J ), LDAB-1, AB( KD+2-LENJ, N-J+1 ), -1 )
+			}
+		} else {
+			for j := 0; j < n/2; j++ {
+			// LENJ = MIN( N-2*J+1, KD+1 )
+			// CALL DSWAP( LENJ, AB( 1, J ), 1, AB( LENJ, N-J+2-LENJ ), -LDAB+1 )
+		}
+	}
+
+	return diag, b
+}
